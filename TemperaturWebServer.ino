@@ -1,27 +1,37 @@
 #include "esp32-mqtt.h"
 #include "Arduino_JSON.h"
+#include "NTPClient.h"
 
 String jsonstring = "";
 JSONVar myObject;
 
 
 const int pin_temp = 4;
+const int pin_jord = 32; 
 const int pin_lys = 12;
 const int pin_vifte = 14;
 const int pin_vanning = 27;
+bool isDay = true;
 
-int max_temp = 21;
-int min_temp = 19;
+int max_day_temp = 22;
+int min_day_temp = 20;
+int max_night_temp = 16;
+int min_night_temp = 14;
+int min_temp = min_day_temp;
+int max_temp = max_day_temp;
+int night_length = 6;
 
 int lysStatus = 0;
 int varmeStatus = 0;
 int vanningStatus = 0;
-
+float jord = 0;
 String header;
  
 DHT dht(pin_temp, DHT11);
 
-
+//Set up time 
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "ntp.justervesenet.no",7200);
 
 // Set web server port number to 80
 WiFiServer server(80);
@@ -33,6 +43,7 @@ unsigned long previousLoopTime = 0;
 const long timeoutTime = 2000;
 
 void setup() {
+  
   
   Serial.begin(115200); 
   pinMode(pin_lys, OUTPUT);
@@ -56,8 +67,14 @@ void setup() {
   Serial.println(WiFi.macAddress());
 
   setupCloudIoT();
+
+  // Init and get the time
+  timeClient.begin();
+
+
   
   server.begin();
+
 
 }
 
@@ -72,6 +89,7 @@ String lookupString(int val) {
 void loop() {
     currentLoopTime = millis();
     if(currentLoopTime > (previousLoopTime+60000)) {
+            
       mqtt->loop();
       delay(10);  // <- fixes some issues with WiFi stability
     
@@ -80,18 +98,52 @@ void loop() {
       }
       myObject["device"] = device_id;
 
+
+      timeClient.update();
+      int hour = timeClient.getHours();
+      if(hour<7) {
+        isDay=false;
+        min_temp = min_night_temp;
+        max_temp = max_night_temp;
+        if(lysStatus==1) {
+              Serial.println("Skrur av lys fordi det er natt");
+              lysStatus = 0;
+              digitalWrite(pin_lys, LOW);
+              myObject["sensor"] = "LysEndring";
+              myObject["value"] = 0;
+              mqtt->publishTelemetry(JSON.stringify(myObject));
+        }
+      } else {
+        isDay=true;
+        min_temp = min_day_temp;
+        max_temp = max_day_temp;
+        if(lysStatus==0) {
+              Serial.println("Skrur på lys fordi det har blitt dag");
+              lysStatus = 1;
+              digitalWrite(pin_lys, HIGH);
+              myObject["sensor"] = "LysEndring";
+              myObject["value"] = 1;
+              mqtt->publishTelemetry(JSON.stringify(myObject));
+        }
+      }
+
       float temp = dht.readTemperature();
       float humidity = dht.readHumidity();
-      if(temp>max_temp){
-              Serial.println("Skrur av vifte fordi det er over 20 grader");
+      
+      if(varmeStatus==1 && (temp>max_temp)){
+              Serial.println("Skrur av vifte fordi det er over ");
+              Serial.print(max_temp);
+              Serial.println(" grader");
               varmeStatus = 0;
               digitalWrite(pin_vifte, LOW);
               myObject["sensor"] = "OppvarmingEndring";
               myObject["value"] = 0;
               mqtt->publishTelemetry(JSON.stringify(myObject));
       }
-      if(temp<min_temp){
-              Serial.println("Skrur p&aring; vifte fordi det er under 18 grader");
+      if(varmeStatus==0 && (temp<min_temp)){
+              Serial.print("Skrur p&aring; vifte fordi det er under ");
+              Serial.print(min_temp);
+              Serial.println(" grader");
               varmeStatus = 1;
               digitalWrite(pin_vifte, HIGH);
               myObject["sensor"] = "OppvarmingEndring";
@@ -119,6 +171,16 @@ void loop() {
       myObject["sensor"] = "Lys";
       myObject["value"] = lysStatus;
       mqtt->publishTelemetry(JSON.stringify(myObject));
+
+
+      jord = analogRead(pin_jord);
+      jord = map(jord,1460,3420,100,0);
+
+      myObject["sensor"] = "Fuktighet i jord";
+      myObject["value"] = jord;
+      mqtt->publishTelemetry(JSON.stringify(myObject));
+      Serial.println("Jordfuktighet");
+      Serial.println(jord);
 
     }
 
@@ -191,7 +253,7 @@ void loop() {
             }  
 
             
-            int soil = analogRead(36);
+            jord = analogRead(pin_jord);
             float h = dht.readHumidity();
             float t = dht.readTemperature();
             float hic = dht.computeHeatIndex(t, h, false);
@@ -214,13 +276,15 @@ void loop() {
             client.print("<br>Luftfuktighet:");
             client.println(h);
             client.print("<br>Jordfuktighet:");
-            client.println(soil);
+            client.println(jord);
 
             // Display current state, and ON(1)/OFF(0) buttons for GPIO 26  
-            client.println("<p>Lys status: " + lookupString(lysStatus) + "</p>");
-            client.println("<p>Varme status: " + lookupString(varmeStatus) + "</p>");
+            client.print("<p>Lys status: " + lookupString(lysStatus) + "</p>");
+            client.print("<p>Varme status: " + lookupString(varmeStatus) + "</p>");
             client.print("<p>Vanning status: " + lookupString(vanningStatus) + "</p>");
-
+            client.print("<p>&Oslash;nsket maksimumstemperatur: ");client.print( max_temp);client.print("</p>");
+            client.print("<p>&Oslash;nsket minimumstemperatur: ");client.print( min_temp);client.print("</p>");
+            
             if (lysStatus==0) {
               client.println("<p><a href=\"/lys/on\"><button class=\"button\">Skru p&aring; lys</button></a></p>");
             } else {
@@ -236,6 +300,8 @@ void loop() {
             } else {
               client.println("<p><a href=\"/vanning/off\"><button class=\"button button2\">Skru av vanning</button></a></p>");
             } 
+
+            client.println("<p><a href=\"/\"><button class=\"button\">Oppfrisk</button></a></p>");
                
             client.println("</body></html>");
             
@@ -259,4 +325,39 @@ void loop() {
     Serial.println("Client disconnected.");
     Serial.println("");
   }  
+}
+
+
+void printLocalTime(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  Serial.print("Day of week: ");
+  Serial.println(&timeinfo, "%A");
+  Serial.print("Month: ");
+  Serial.println(&timeinfo, "%B");
+  Serial.print("Day of Month: ");
+  Serial.println(&timeinfo, "%d");
+  Serial.print("Year: ");
+  Serial.println(&timeinfo, "%Y");
+  Serial.print("Hour: ");
+  Serial.println(&timeinfo, "%H");
+  Serial.print("Hour (12 hour format): ");
+  Serial.println(&timeinfo, "%I");
+  Serial.print("Minute: ");
+  Serial.println(&timeinfo, "%M");
+  Serial.print("Second: ");
+  Serial.println(&timeinfo, "%S");
+
+  Serial.println("Time variables");
+  char timeHour[3];
+  strftime(timeHour,3, "%H", &timeinfo);
+  Serial.println(timeHour);
+  char timeWeekDay[10];
+  strftime(timeWeekDay,10, "%A", &timeinfo);
+  Serial.println(timeWeekDay);
+  Serial.println();
 }
